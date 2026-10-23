@@ -130,6 +130,8 @@ struct HidPad {
     IOHIDElementRef buttons[16] = {};
     IOHIDElementRef hat = nullptr;
     IOHIDElementRef axis[4] = {};  // left X, left Y, right X, right Y
+    float centre[4] = {};          // each axis' resting value, taken from the first reading
+    float reach[4][2] = {};        // how far each axis has been seen to travel below / above its centre
 };
 static std::vector<HidPad> g_hid;  // main thread
 static void note_dominant_labels();
@@ -209,7 +211,7 @@ static float hid_value(IOHIDDeviceRef dev, IOHIDElementRef el, bool* valid = nul
     return (float)IOHIDValueGetIntegerValue(v);
 }
 
-static bool hid_values(const HidPad& p, float* v) {
+static bool hid_values(HidPad& p, float* v) {
     using namespace input_map;
     for (int i = 0; i < kPadCount; i++) v[i] = 0;
     auto btn = [&](int usage, int pad) { if (hid_value(p.dev, p.buttons[usage - 1]) > 0.5f) v[pad] = 1; };
@@ -231,7 +233,15 @@ static bool hid_values(const HidPad& p, float* v) {
     for (int i = 0; i < 4; i++) {
         if (!p.axis[i]) continue;
         const float lo = IOHIDElementGetLogicalMin(p.axis[i]), hi = IOHIDElementGetLogicalMax(p.axis[i]);
-        if (hi > lo) a[i] = std::clamp((hid_value(p.dev, p.axis[i]) - lo) / (hi - lo) * 2.f - 1.f, -1.f, 1.f);
+        if (hi <= lo) continue;
+        // clone sticks often stop well short of the HID range, so scale by the travel actually seen
+        const float half = (hi - lo) / 2, now = hid_value(p.dev, p.axis[i]);
+        if (p.centre[i] == 0) p.centre[i] = now;
+        const float d = now - p.centre[i];
+        float* r = p.reach[i];
+        if (r[0] <= 0) r[0] = r[1] = half * 0.3f;
+        if (d < 0) r[0] = std::max(r[0], -d); else r[1] = std::max(r[1], d);
+        a[i] = std::clamp(d / (d < 0 ? r[0] : r[1]), -1.f, 1.f);
     }
     v[a[0] > 0 ? kPadLSRight : kPadLSLeft] = std::fabs(a[0]);
     v[a[1] > 0 ? kPadLSDown : kPadLSUp] = std::fabs(a[1]);  // HID Y grows downwards
@@ -263,7 +273,7 @@ static std::vector<std::pair<uintptr_t, overlay::PadValues>> devices_values() {
         overlay::PadValues d;
         if (device_values(c, d.data())) out.emplace_back((uintptr_t)(__bridge void*)c, d);
     }
-    for (const auto& p : g_hid) {
+    for (auto& p : g_hid) {
         if (!hid_is_extra(p) || !selected_matches(p.name)) continue;
         overlay::PadValues d;
         if (hid_values(p, d.data())) out.emplace_back((uintptr_t)p.dev, d);
