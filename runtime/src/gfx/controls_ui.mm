@@ -28,7 +28,7 @@
 #include "../platform/host.h"
 #include "../overlay/overlay.h"
 
-namespace gfx { void show_drc_window(bool on); }
+namespace gfx { void show_drc_window(bool on); void set_host_setting(const char* key, const std::string& value); }
 
 using namespace input_map;
 
@@ -219,6 +219,7 @@ struct UIState {
 @property(strong) WWPadView* padView;
 @property(strong) NSTextField* status;
 @property(strong) NSTextField* padInfo;
+@property(strong) NSPopUpButton* controllerPopup;  // which connected controller plays
 @property(strong) NSSegmentedControl* which;
 @property(strong) NSSegmentedControl* faceLayout;
 @property(strong) NSSlider* deadzone;
@@ -994,6 +995,7 @@ static NSRect x_rect(NSRect chip) { return NSMakeRect(NSMaxX(chip) - 7, chip.ori
     double _messageTime;
     bool _freezeView;  // snapshot in progress: don't follow the Input menu
     NSString* _lastPadInfo;
+    NSArray<NSString*>* _lastPadNames;
 }
 
 - (instancetype)init {
@@ -1052,6 +1054,11 @@ static NSTextField* label(NSString* s) {
     pi.alignment = NSTextAlignmentRight;
     pi.lineBreakMode = NSLineBreakByTruncatingTail;
     self.padInfo = pi;
+    NSPopUpButton* cdev = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    cdev.target = self;
+    cdev.action = @selector(controllerDeviceChanged:);
+    cdev.toolTip = @"Which controller plays. Controllers macOS does not recognise (clone Pro Controllers) are listed too.";
+    self.controllerPopup = cdev;
     [pi setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
 
     WWPadView* pv = [[WWPadView alloc] init];
@@ -1146,18 +1153,18 @@ static NSTextField* label(NSString* s) {
     pc.toolTip = @"Green A, red B, blue X and yellow Y in the Xbox look; coloured shapes in the PlayStation look. "
                  @"Off: the game's white buttons (in the Xbox positions while the face buttons are by label).";
     self.promptColours = pc;
-    for (NSView* v in @[which, skip, fl, pi, pv, sep, st, reset, dzl, dz, dzv, inv, lrl, lr, lrv, rrl, rr, rrv, rh, ppl, pp, snl, sn, pc]) {
+    for (NSView* v in @[which, skip, cdev, fl, pi, pv, sep, st, reset, dzl, dz, dzv, inv, lrl, lr, lrv, rrl, rr, rrv, rh, ppl, pp, snl, sn, pc]) {
         v.translatesAutoresizingMaskIntoConstraints = NO;
         [root addSubview:v];
     }
 
-    NSDictionary* v = NSDictionaryOfVariableBindings(which, skip, fl, pi, pv, sep, st, reset, dzl, dz, dzv, inv, lrl, lr, lrv, rrl, rr, rrv, rh,
+    NSDictionary* v = NSDictionaryOfVariableBindings(which, skip, cdev, fl, pi, pv, sep, st, reset, dzl, dz, dzv, inv, lrl, lr, lrv, rrl, rr, rrv, rh,
                                                      ppl, pp, snl, sn, pc);
     auto C = [&](NSString* f, NSLayoutFormatOptions o = 0) {
         [root addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:f options:o metrics:nil views:v]];
     };
     C(@"H:|-14-[which]-(>=12)-[fl]-12-[pi]-14-|", NSLayoutFormatAlignAllCenterY);
-    C(@"H:|-14-[skip]-(>=14)-|");
+    C(@"H:|-14-[skip]-(>=14)-[cdev(>=230)]-14-|", NSLayoutFormatAlignAllCenterY);
     C(@"H:|-0-[pv]-0-|");
     C(@"H:|-0-[sep]-0-|");
     C(@"H:|-16-[st]-16-|");
@@ -1301,9 +1308,31 @@ static NSTextField* label(NSString* s) {
     input::held_keys(keys);
     for (int i = 0; i < 256; i++) keys[i] = keys[i] || _localKeys[i];
     float v[kPadCount] = {};
-    NSArray<GCController*>* pads = no_host ? @[] : GCController.controllers;
+    NSMutableArray<NSString*>* pads = [NSMutableArray array];
+    if (!no_host)
+        for (const std::string& n : input::controller_names()) [pads addObject:[NSString stringWithUTF8String:n.c_str()]];
     if (!no_host) input::controller_values(v);
     _st.padConnected = pads.count > 0;
+    {
+        NSString* chosen = [NSString stringWithUTF8String:input::selected_controller().c_str()];
+        NSArray* key = [pads arrayByAddingObject:chosen];
+        if (![key isEqualToArray:_lastPadNames]) {
+            _lastPadNames = key;
+            [self.controllerPopup removeAllItems];
+            [self.controllerPopup addItemWithTitle:@"All connected controllers"];
+            self.controllerPopup.lastItem.representedObject = @"";
+            for (NSString* n in pads) {
+                [self.controllerPopup addItemWithTitle:n];
+                self.controllerPopup.lastItem.representedObject = n;
+            }
+            if (chosen.length && ![pads containsObject:chosen]) {
+                [self.controllerPopup addItemWithTitle:[chosen stringByAppendingString:@" (not connected)"]];
+                self.controllerPopup.lastItem.representedObject = chosen;
+            }
+            for (NSMenuItem* it in self.controllerPopup.itemArray)
+                if ([it.representedObject isEqualToString:chosen]) [self.controllerPopup selectItem:it];
+        }
+    }
     // capture from a controller: a new press (held inputs count once released)
     if (_st.capAction >= 0 && (_st.capMode == kCapAny || _st.capMode == kCapPad)) {
         for (int p = 1; p < kPadCount; p++) {
@@ -1342,9 +1371,7 @@ static NSTextField* label(NSString* s) {
     if (no_host) info = @"Host controllers ignored (test run)";
     else if (!pads.count) info = @"No game controller connected — keyboard only";
     else {
-        NSMutableArray* names = [NSMutableArray array];
-        for (GCController* c in pads) [names addObject:c.vendorName ?: @"Controller"];
-        info = [NSString stringWithFormat:@"Connected: %@", [names componentsJoinedByString:@", "]];
+        info = [NSString stringWithFormat:@"Connected: %@", [pads componentsJoinedByString:@", "]];
     }
     if (![info isEqualToString:_lastPadInfo]) {
         _lastPadInfo = info;
@@ -1559,6 +1586,12 @@ static bool modifier_down(uint16_t code, NSEventModifierFlags f, bool* known) {
 - (void)invertChanged:(NSButton*)b {
     _st.m.invert_camera_y = b.state == NSControlStateValueOn;
     [self commit];
+}
+
+- (void)controllerDeviceChanged:(NSPopUpButton*)sender {
+    NSString* n = sender.selectedItem.representedObject ?: @"";
+    input::select_controller(n.UTF8String);
+    gfx::set_host_setting("controllerDevice", n.UTF8String);
 }
 
 - (void)promptsChanged:(id)sender {

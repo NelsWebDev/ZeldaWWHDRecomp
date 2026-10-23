@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace input {
 
@@ -35,6 +36,13 @@ bool pro_controller();
 void set_pro_controller(bool on);
 // called (any thread) when set_pro_controller changes the choice (controller_reapply: the game follows)
 void set_controller_listener(void (*fn)(bool pro));
+
+// Which host controller drives the game. An empty name means every connected controller (strongest
+// input wins). The list also holds generic HID pads the platform's game controller API does not
+// recognise (clone Pro Controllers and the like). Any thread.
+std::vector<std::string> controller_names();
+std::string selected_controller();
+void select_controller(const std::string& name);
 
 void init();       // main thread, after NSApplication exists
 PadState read();   // any thread

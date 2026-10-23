@@ -1975,6 +1975,25 @@ void tab_controls() {
     flow::next(flow::check("Wii U Pro Controller"));
     if (radio("Wii U Pro Controller", pro))
         hostui::post([] { hostui::set_pro_controller(true); hostui::set("proController", "1"); });
+    // which connected controller drives the game (generic HID pads the system does not recognise included)
+    {
+        const std::vector<std::string> names = input::controller_names();
+        const std::string chosen = input::selected_controller();
+        const bool missing = !chosen.empty() && std::find(names.begin(), names.end(), chosen) == names.end();
+        const std::string preview = chosen.empty() ? "All connected controllers" : chosen + (missing ? " (not connected)" : "");
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Controller");
+        ImGui::SameLine();
+        if (ImGui::BeginCombo("##controller_device", preview.c_str())) {
+            if (ImGui::Selectable("All connected controllers", chosen.empty()))
+                hostui::post([] { input::select_controller(""); hostui::set("controllerDevice", ""); });
+            for (const std::string& n : names)
+                if (ImGui::Selectable(n.c_str(), n == chosen))
+                    hostui::post([n] { input::select_controller(n); hostui::set("controllerDevice", n.c_str()); });
+            ImGui::EndCombo();
+        }
+        help("Choose which controller plays. Controllers the system does not recognise (clone Pro Controllers) are listed too.");
+    }
     // List view at the right edge, or on the next line when the row leaves no room (phones)
     flow::next(flow::check("List view"));
     ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - flow::check("List view")));
@@ -2836,6 +2855,7 @@ ImDrawData* frame(float pw, float ph, void (*renderer_init)()) {
         // the saved controller choice (WWHD_PRO_CONTROLLER wins); it also hides or shows the GamePad screen
         if (!getenv("WWHD_PRO_CONTROLLER") && hostui::get("proController", v))
             hostui::post([pro = v == "1"] { hostui::set_pro_controller(pro); });
+        if (hostui::get("controllerDevice", v) && !v.empty()) hostui::post([v] { input::select_controller(v); });
         // the saved rumble choice (WWHD_RUMBLE wins)
         if (!rumble::env_override() && hostui::get("rumble", v)) rumble::set_enabled(v != "0");
 #ifdef __ANDROID__

@@ -561,6 +561,16 @@ B right, X left, Y top. In-game shoulder prompts use R1/R2 for R/ZR and L1/L2 fo
 The **Input** menu switches whether keyboard and controllers act as the Wii U GamePad (default)
 or as a Wii U Pro Controller (`WWHD_PRO_CONTROLLER=1` starts in that mode); with the Pro
 Controller, the GamePad window keeps its screen and touch input.
+
+**Choosing a controller.** The Controls window (macOS) and the settings overlay (F1 → Controls, all
+platforms) have a **Controller** dropdown: *All connected controllers* (default, the strongest input
+wins) or one specific pad, remembered between starts. On macOS the list also holds generic and clone
+pads that Apple's GameController framework does not recognise (for example a PowerA "Lic Pro
+Controller", which reports no vendor or product ID). Those are read over HID with the Switch Pro
+Controller's layout: B A Y X, L R ZL ZR, Minus, Plus, stick clicks, Home, Capture, the D-pad and both
+sticks. macOS asks for **Input Monitoring** for this; if the pad does not show up, enable Wind Waker HD
+in System Settings › Privacy & Security › Input Monitoring and restart the game. Windows and Linux
+read such pads through SDL3, which already recognises them.
 When the game asks for text (e.g. your name), the text window described above opens.
 
 Rumble works too (SDL hosts): what the game asks its controller's motor to do is passed to the

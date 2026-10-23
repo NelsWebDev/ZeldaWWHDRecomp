@@ -7,6 +7,11 @@ what is on `devel` and not released yet (also in the
 
 ## Next update
 
+- **macOS: generic and clone controllers work, and you can choose the controller.** A pad Apple's GameController
+  framework does not recognise (such as the PowerA Lic Pro Controller, which has no vendor ID) was ignored; it is
+  now read over HID with the Switch Pro Controller's layout (macOS asks for Input Monitoring). A new **Controller**
+  dropdown in the Controls window and the settings overlay picks one connected controller or all of them.
+
 ## v0.4.0
 
 - **Fixed: switches and doors waited for a restart in the world editor.** With all of the editor's live kinds

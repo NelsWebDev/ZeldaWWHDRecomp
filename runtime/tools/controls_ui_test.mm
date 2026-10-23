@@ -10,6 +10,9 @@ namespace overlay { void external_binding_capture(bool){} }
 namespace input {
 bool pro_controller(){return false;}
 void set_pro_controller(bool){}
+std::vector<std::string> controller_names(){return {};}
+std::string selected_controller(){return {};}
+void select_controller(const std::string&){}
 void release_keys(){}
 void held_keys(bool* v){std::fill(v,v+256,false);}
 void controller_values(float* v){std::fill(v,v+input_map::kPadCount,0.f);}

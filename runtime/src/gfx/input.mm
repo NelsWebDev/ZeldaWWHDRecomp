@@ -16,9 +16,12 @@ namespace gx2 { void checkpoint_vulkan_caches(); void checkpoint_present_observe
 // switchable to by-label with input_map::FaceLayout (issue #78).
 #import <AppKit/AppKit.h>
 #import <GameController/GameController.h>
+#import <IOKit/hid/IOHIDLib.h>
+#import <IOKit/hidsystem/IOHIDLib.h>
 #import <QuartzCore/QuartzCore.h>  // CACurrentMediaTime
 #include <Carbon/Carbon.h>  // kVK_* key codes
 
+#include <algorithm>
 #include <cmath>
 #include <mutex>
 
@@ -118,14 +121,172 @@ static bool device_values(GCController* c, float* v) {
     return true;
 }
 
+// ---- generic HID pads: controllers GameController does not recognise (a clone Pro Controller reports
+// vendor 0 / product 0). They are read with the Switch Pro Controller's HID layout: buttons 1-14 are
+// B A Y X L R ZL ZR Minus Plus L3 R3 Home Capture, a hat, and the X Y Rx Ry axes.
+struct HidPad {
+    IOHIDDeviceRef dev = nullptr;
+    std::string name;
+    IOHIDElementRef buttons[16] = {};
+    IOHIDElementRef hat = nullptr;
+    IOHIDElementRef axis[4] = {};  // left X, left Y, right X, right Y
+};
+static std::vector<HidPad> g_hid;  // main thread
+static void note_dominant_labels();
+
+static std::string hid_name(IOHIDDeviceRef dev) {
+    NSString* n = (__bridge NSString*)IOHIDDeviceGetProperty(dev, CFSTR(kIOHIDProductKey));
+    return n.length ? n.UTF8String : "Generic controller";
+}
+
+static void hid_added(void*, IOReturn, void*, IOHIDDeviceRef dev) {
+    for (const auto& p : g_hid) if (p.dev == dev) return;
+    HidPad pad;
+    pad.dev = (IOHIDDeviceRef)CFRetain(dev);
+    pad.name = hid_name(dev);
+    NSArray* els = (__bridge_transfer NSArray*)IOHIDDeviceCopyMatchingElements(dev, nullptr, kIOHIDOptionsTypeNone);
+    for (id e in els) {
+        IOHIDElementRef el = (__bridge IOHIDElementRef)e;
+        const uint32_t page = IOHIDElementGetUsagePage(el), usage = IOHIDElementGetUsage(el);
+        if (page == kHIDPage_Button && usage >= 1 && usage <= 16) pad.buttons[usage - 1] = el;
+        else if (page == kHIDPage_GenericDesktop) {
+            if (usage == kHIDUsage_GD_Hatswitch) pad.hat = el;
+            else if (usage == kHIDUsage_GD_X) pad.axis[0] = el;
+            else if (usage == kHIDUsage_GD_Y) pad.axis[1] = el;
+            else if (usage == kHIDUsage_GD_Rx) pad.axis[2] = el;
+            else if (usage == kHIDUsage_GD_Ry) pad.axis[3] = el;
+            else if (usage == kHIDUsage_GD_Z && !pad.axis[2]) pad.axis[2] = el;
+            else if (usage == kHIDUsage_GD_Rz && !pad.axis[3]) pad.axis[3] = el;
+        }
+    }
+    for (auto& b : pad.buttons) if (b) CFRetain(b);
+    if (pad.hat) CFRetain(pad.hat);
+    for (auto& a : pad.axis) if (a) CFRetain(a);
+    LOG("[input] generic HID controller connected: %s", pad.name.c_str());
+    g_hid.push_back(pad);
+    note_dominant_labels();
+}
+
+static void hid_removed(void*, IOReturn, void*, IOHIDDeviceRef dev) {
+    for (size_t i = 0; i < g_hid.size(); i++) {
+        if (g_hid[i].dev != dev) continue;
+        LOG("[input] generic HID controller disconnected: %s", g_hid[i].name.c_str());
+        for (auto b : g_hid[i].buttons) if (b) CFRelease(b);
+        if (g_hid[i].hat) CFRelease(g_hid[i].hat);
+        for (auto a : g_hid[i].axis) if (a) CFRelease(a);
+        CFRelease(g_hid[i].dev);
+        g_hid.erase(g_hid.begin() + i);
+        note_dominant_labels();
+        return;
+    }
+}
+
+static void hid_start() {
+    // Reading a generic HID pad needs the Input Monitoring permission; without it the pad is silently
+    // absent. Ask once (macOS shows its prompt) and log the outcome.
+    if (IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted) {
+        LOG("[input] Input Monitoring is not granted: asking for it (System Settings > Privacy & Security > Input Monitoring)");
+        IOHIDRequestAccess(kIOHIDRequestTypeListenEvent);
+    }
+    IOHIDManagerRef mgr = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
+    NSArray* match = @[
+        @{@kIOHIDDeviceUsagePageKey: @(kHIDPage_GenericDesktop), @kIOHIDDeviceUsageKey: @(kHIDUsage_GD_Joystick)},
+        @{@kIOHIDDeviceUsagePageKey: @(kHIDPage_GenericDesktop), @kIOHIDDeviceUsageKey: @(kHIDUsage_GD_GamePad)},
+    ];
+    IOHIDManagerSetDeviceMatchingMultiple(mgr, (__bridge CFArrayRef)match);
+    IOHIDManagerRegisterDeviceMatchingCallback(mgr, hid_added, nullptr);
+    IOHIDManagerRegisterDeviceRemovalCallback(mgr, hid_removed, nullptr);
+    IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+    const IOReturn r = IOHIDManagerOpen(mgr, kIOHIDOptionsTypeNone);
+    if (r != kIOReturnSuccess) LOG("[input] generic HID controllers unavailable: IOHIDManagerOpen 0x%x", (unsigned)r);
+}
+
+static float hid_value(IOHIDDeviceRef dev, IOHIDElementRef el, bool* valid = nullptr) {
+    IOHIDValueRef v = nullptr;
+    if (valid) *valid = false;
+    if (!el || IOHIDDeviceGetValue(dev, el, &v) != kIOReturnSuccess || !v) return 0;
+    if (valid) *valid = true;
+    return (float)IOHIDValueGetIntegerValue(v);
+}
+
+static bool hid_values(const HidPad& p, float* v) {
+    using namespace input_map;
+    for (int i = 0; i < kPadCount; i++) v[i] = 0;
+    auto btn = [&](int usage, int pad) { if (hid_value(p.dev, p.buttons[usage - 1]) > 0.5f) v[pad] = 1; };
+    btn(1, kPadA); btn(2, kPadB); btn(3, kPadX); btn(4, kPadY);  // positions: south, east, west, north
+    btn(5, kPadLB); btn(6, kPadRB); btn(7, kPadLT); btn(8, kPadRT);
+    btn(9, kPadOptions); btn(10, kPadMenu); btn(11, kPadL3); btn(12, kPadR3);
+    btn(13, kPadHome); btn(14, kPadCapture);
+    if (p.hat) {
+        bool ok;
+        const int h = (int)hid_value(p.dev, p.hat, &ok) - (int)IOHIDElementGetLogicalMin(p.hat);
+        if (ok && h >= 0 && h <= 7) {  // 0 = up, clockwise
+            if (h == 7 || h == 0 || h == 1) v[kPadDUp] = 1;
+            if (h >= 1 && h <= 3) v[kPadDRight] = 1;
+            if (h >= 3 && h <= 5) v[kPadDDown] = 1;
+            if (h >= 5 && h <= 7) v[kPadDLeft] = 1;
+        }
+    }
+    float a[4] = {};
+    for (int i = 0; i < 4; i++) {
+        if (!p.axis[i]) continue;
+        const float lo = IOHIDElementGetLogicalMin(p.axis[i]), hi = IOHIDElementGetLogicalMax(p.axis[i]);
+        if (hi > lo) a[i] = std::clamp((hid_value(p.dev, p.axis[i]) - lo) / (hi - lo) * 2.f - 1.f, -1.f, 1.f);
+    }
+    v[a[0] > 0 ? kPadLSRight : kPadLSLeft] = std::fabs(a[0]);
+    v[a[1] > 0 ? kPadLSDown : kPadLSUp] = std::fabs(a[1]);  // HID Y grows downwards
+    v[a[2] > 0 ? kPadRSRight : kPadRSLeft] = std::fabs(a[2]);
+    v[a[3] > 0 ? kPadRSDown : kPadRSUp] = std::fabs(a[3]);
+    return true;
+}
+
+// the generic pads GameController does not already serve
+static bool hid_is_extra(const HidPad& p) {
+    for (GCController* c in [GCController controllers])
+        if (c.extendedGamepad && c.vendorName && p.name == c.vendorName.UTF8String) return false;
+    return true;
+}
+
+static std::mutex g_sel_mu;
+static std::string g_selected;       // "" = every controller
+static std::vector<std::string> g_names;  // the connected controllers, refreshed by the poll timer
+static bool selected_matches(const std::string& name) {
+    std::lock_guard<std::mutex> lk(g_sel_mu);
+    return g_selected.empty() || g_selected == name;
+}
+
 // each connected controller's values, keyed by the controller: a reconnected one is a new object
 static std::vector<std::pair<uintptr_t, overlay::PadValues>> devices_values() {
     std::vector<std::pair<uintptr_t, overlay::PadValues>> out;
     for (GCController* c in [GCController controllers]) {
+        if (!selected_matches(c.vendorName ? c.vendorName.UTF8String : "Controller")) continue;
         overlay::PadValues d;
         if (device_values(c, d.data())) out.emplace_back((uintptr_t)(__bridge void*)c, d);
     }
+    for (const auto& p : g_hid) {
+        if (!hid_is_extra(p) || !selected_matches(p.name)) continue;
+        overlay::PadValues d;
+        if (hid_values(p, d.data())) out.emplace_back((uintptr_t)p.dev, d);
+    }
     return out;
+}
+
+static void refresh_names() {
+    std::vector<std::string> names;
+    for (GCController* c in [GCController controllers])
+        if (c.extendedGamepad) names.push_back(c.vendorName ? c.vendorName.UTF8String : "Controller");
+    for (const auto& p : g_hid) if (hid_is_extra(p)) names.push_back(p.name);
+    std::lock_guard<std::mutex> lk(g_sel_mu);
+    g_names = std::move(names);
+}
+std::vector<std::string> controller_names() { std::lock_guard<std::mutex> lk(g_sel_mu); return g_names; }
+std::string selected_controller() { std::lock_guard<std::mutex> lk(g_sel_mu); return g_selected; }
+void select_controller(const std::string& name) {
+    {
+        std::lock_guard<std::mutex> lk(g_sel_mu);
+        g_selected = name;
+    }
+    LOG("[input] controller: %s", name.empty() ? "all connected" : name.c_str());
 }
 
 // every mappable controller input, 0..1, the strongest over all connected controllers
@@ -191,6 +352,9 @@ static void note_dominant_labels() {
         input_map::apple_face_labels(controller_face_layout(dominant), labels);
         if (!any) family_letters(dominant, labels);  // nothing printed we can read: guess the family
     }
+    if (!dominant)
+        for (const auto& p : g_hid)
+            if (hid_is_extra(p)) { labels[0] = FL::kB; labels[1] = FL::kA; labels[2] = FL::kY; labels[3] = FL::kX; break; }
     input_map::note_face_labels(labels);
     if (dominant && input_map::apple_face_workaround(input_map::current(), controller_face_layout(dominant)))
         LOG("[input] Nintendo pad with by-label bindings: if these were the old macOS workaround, "
@@ -437,6 +601,7 @@ void init() {
         release_keys();
     }];
     [GCController startWirelessControllerDiscoveryWithCompletionHandler:nil];
+    hid_start();
     // the Automatic face preset follows the pad that was plugged in first (issue #78 follow-up)
     g_connect_order = [NSMutableArray array];
     for (GCController* c in [GCController controllers]) [g_connect_order addObject:c];
@@ -469,6 +634,7 @@ void init() {
         }
         // gyro: sensors on or off with the source, the recalibrate binding, the mouse gyro's capture
         static int tick = 0;
+        if (tick % 60 == 0) refresh_names();
         if (@available(macOS 11.0, *)) if (tick++ % 60 == 0) update_motion_sensors();
         if (!overlay::blocks_input() && !getenv("WWHD_NO_HOST_INPUT")) {
             bool keys[256];

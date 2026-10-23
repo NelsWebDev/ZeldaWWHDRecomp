@@ -870,8 +870,10 @@ void update(){
  float v[kPadCount]={},game[kPadCount]={};
  const bool captured_before=overlay::captures();
  std::vector<std::pair<SDL_JoystickID,overlay::PadValues>> devices;
+ const std::string wanted=selected_controller();
  for(auto [id,pad]:g_controllers){
   if(!SDL_GamepadConnected(pad))continue;
+  if(!wanted.empty()){const char* pn=SDL_GetGamepadName(pad);if(wanted!=(pn?pn:"Controller"))continue;}
   std::array<float,kPadCount> d{};
   auto put=[&](int p,float x){d[p]=std::max(d[p],x);};
   auto button=[&](SDL_GamepadButton b,int p){put(p,SDL_GetGamepadButton(pad,b)?1.f:0.f);};
@@ -1087,6 +1089,20 @@ static void apply_scenario(PadState& s) {
         if (t >= p.from && t < p.to) { s.rx = p.x; s.ry = p.y; }
     for (auto& p : sc.presses)
         if (t >= p.from && t < p.to) s.buttons |= p.bits;
+}
+
+static std::mutex g_selected_mu;
+static std::string g_selected;
+std::vector<std::string> controller_names(){
+ std::lock_guard lk(g_pads_mu);
+ std::vector<std::string> names;
+ for(auto [id,pad]:g_controllers)if(SDL_GamepadConnected(pad)){const char* n=SDL_GetGamepadName(pad);names.push_back(n?n:"Controller");}
+ return names;
+}
+std::string selected_controller(){std::lock_guard lk(g_selected_mu);return g_selected;}
+void select_controller(const std::string& name){
+ {std::lock_guard lk(g_selected_mu);g_selected=name;}
+ LOG("[input] controller: %s",name.empty()?"all connected":name.c_str());
 }
 
 static std::atomic<bool> g_pro{getenv("WWHD_PRO_CONTROLLER") != nullptr};
